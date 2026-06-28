@@ -1,19 +1,28 @@
 /*
  * mpd_retro.c  —  320×240 GTK3 retro MPD display
  *
- * Looks like a late-90s rack-mount CD/DVD player front panel:
- *   • VFD-style blue-on-dark background
- *   • Scrolling title marquee
- *   • Progress bar (segment-dot style)
- *   • Artist / Album lines
- *   • Time elapsed / total
- *   • Play state glyph  ▶  ▐▐  ■
- *   • Volume knob readout and bitrate
+ * VFD-style front-panel display, no on-screen buttons —
+ * all control is via hardware buttons / IR receiver.
+ *
+ * Layout (screen fills the full bezel):
+ *
+ *   ┌─────────────────────────────────────┐
+ *   │ RETRO·MPD                       [●] │  ← brand + LED
+ *   │ ▶  Scrolling Title Here …           │  ← state + marquee
+ *   │─────────────────────────────────────│
+ *   │  Artist Name                        │
+ *   │  Album Title                        │
+ *   │─────────────────────────────────────│
+ *   │  · · · · · · · · · · · · · · · ·   │  ← dot progress
+ *   │           02:34 / 04:12             │  ← time
+ *   │─────────────────────────────────────│
+ *   │      320kbps · 44kHz · VOL 85%      │  ← tech info
+ *   └─────────────────────────────────────┘
  *
  * Build:
  *   gcc $(pkg-config --cflags --libs gtk+-3.0) -lm -o mpd_retro mpd_retro.c
  *
- * MPD is contacted at localhost:6600 (override with MPD_HOST / MPD_PORT env).
+ * MPD: localhost:6600  (override: MPD_HOST / MPD_PORT env vars)
  */
 
 #include <gtk/gtk.h>
@@ -29,57 +38,55 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <unistd.h>
-#include <fcntl.h>
 #include <errno.h>
 
 /* ── geometry ───────────────────────────────────────────────── */
-#define WIN_W   320
-#define WIN_H   240
+#define WIN_W  320
+#define WIN_H  240
 
-/* ── MPD poll interval (ms) ─────────────────────────────────── */
+/* ── poll interval ──────────────────────────────────────────── */
 #define POLL_MS 1000
 
-/* ── colours (VFD palette) ──────────────────────────────────── */
-#define COL_BG          0.04, 0.04, 0.08       /* near-black chassis    */
-#define COL_SCREEN_BG   0.02, 0.04, 0.14       /* deep blue screen      */
-#define COL_BRIGHT      0.35, 0.80, 1.00       /* bright VFD cyan-blue  */
-#define COL_DIM         0.08, 0.22, 0.38       /* dim VFD (inactive)    */
-#define COL_ACCENT      0.00, 0.55, 0.90       /* medium VFD            */
-#define COL_AMBER       1.00, 0.65, 0.00       /* amber indicator LED   */
-#define COL_RED_LED     1.00, 0.18, 0.10       /* red indicator LED     */
-#define COL_BEZEL       0.18, 0.18, 0.22       /* plastic bezel         */
-#define COL_RIVET       0.30, 0.30, 0.35       /* decorative rivets     */
+/* ── VFD colour palette ─────────────────────────────────────── */
+#define COL_CHASSIS   0.04, 0.04, 0.08        /* outer body            */
+#define COL_SCREEN    0.015, 0.030, 0.120     /* screen background     */
+#define COL_BRIGHT    0.40, 0.85, 1.00        /* bright VFD cyan       */
+#define COL_MID       0.00, 0.55, 0.88        /* medium VFD            */
+#define COL_DIM       0.06, 0.20, 0.36        /* inactive segments     */
+#define COL_AMBER     1.00, 0.62, 0.00        /* connection OK LED     */
+#define COL_RED       1.00, 0.16, 0.08        /* connection fail LED   */
 
 /* ── MPD state ──────────────────────────────────────────────── */
 typedef struct {
     char  title[256];
     char  artist[256];
     char  album[256];
-    char  state[16];      /* "play" "pause" "stop" */
-    int   elapsed;        /* seconds               */
-    int   duration;       /* seconds               */
-    int   volume;         /* 0‥100, -1=unknown     */
-    int   bitrate;        /* kbps                  */
-    int   samplerate;     /* Hz                    */
+    char  state[16];   /* "play" | "pause" | "stop" */
+    int   elapsed;     /* seconds */
+    int   duration;    /* seconds */
+    int   volume;      /* 0-100, -1 = unknown */
+    int   bitrate;     /* kbps */
+    int   samplerate;  /* Hz */
+    int   song;        /* 0-based playlist index, -1 = unknown */
+    int   playlistlen; /* total tracks in playlist, 0 = unknown */
     int   connected;
 } MpdState;
 
-/* ── widget data ─────────────────────────────────────────────── */
+/* ── application data ───────────────────────────────────────── */
 typedef struct {
     GtkWidget *canvas;
     MpdState   mpd;
 
-    /* marquee scroll */
-    double     scroll_x;
-    double     scroll_px_per_tick;
-    int        title_px_width;    /* rendered pixel width of title string */
+    double  scroll_x;
+    double  scroll_speed;   /* px / anim frame */
+    int     title_px_w;     /* cached rendered width of title */
 
-    guint      poll_id;
-    guint      anim_id;
+    guint   anim_id;
+    guint   poll_id;
 } AppData;
 
 /* ══════════════════════════════════════════════════════════════
- *  MPD client (minimal, non-blocking read with timeout)
+ *  Minimal MPD client
  * ══════════════════════════════════════════════════════════════ */
 
 static int mpd_connect(const char *host, int port)
@@ -96,13 +103,12 @@ static int mpd_connect(const char *host, int port)
 
     struct sockaddr_in sa = {
         .sin_family = AF_INET,
-        .sin_port   = htons(port),
+        .sin_port   = htons((uint16_t)port),
     };
-    memcpy(&sa.sin_addr, he->h_addr_list[0], he->h_length);
+    memcpy(&sa.sin_addr, he->h_addr_list[0], (size_t)he->h_length);
 
     if (connect(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
-        close(fd);
-        return -1;
+        close(fd); return -1;
     }
     return fd;
 }
@@ -112,8 +118,7 @@ static int mpd_readline(int fd, char *buf, int sz)
     int i = 0;
     while (i < sz - 1) {
         char c;
-        int r = recv(fd, &c, 1, 0);
-        if (r <= 0) break;
+        if (recv(fd, &c, 1, 0) <= 0) break;
         if (c == '\n') { buf[i] = '\0'; return i; }
         buf[i++] = c;
     }
@@ -123,425 +128,440 @@ static int mpd_readline(int fd, char *buf, int sz)
 
 static void mpd_poll(MpdState *s)
 {
-    const char *host = getenv("MPD_HOST") ? getenv("MPD_HOST") : "localhost";
+    const char *host = getenv("MPD_HOST") ? getenv("MPD_HOST") : "192.168.1.67";
     int port = getenv("MPD_PORT") ? atoi(getenv("MPD_PORT")) : 6600;
 
     int fd = mpd_connect(host, port);
     if (fd < 0) {
         s->connected = 0;
         snprintf(s->title,  sizeof(s->title),  "NO CONNECTION");
-        snprintf(s->artist, sizeof(s->artist), "MPD @ %s:%d", host, port);
-        snprintf(s->album,  sizeof(s->album),  "");
+        snprintf(s->artist, sizeof(s->artist), "mpd @ %s:%d", host, port);
+        s->album[0] = '\0';
         snprintf(s->state,  sizeof(s->state),  "stop");
         s->elapsed = s->duration = 0;
         return;
     }
 
     char line[512];
-    /* read banner */
-    mpd_readline(fd, line, sizeof(line));
-    if (strncmp(line, "OK MPD", 6) != 0) { close(fd); s->connected=0; return; }
+    mpd_readline(fd, line, sizeof(line));   /* banner */
+    if (strncmp(line, "OK MPD", 6) != 0) { close(fd); s->connected = 0; return; }
 
-    /* ── currentsong ── */
+    /* currentsong */
     send(fd, "currentsong\n", 12, 0);
-
     s->title[0] = s->artist[0] = s->album[0] = '\0';
-
-    while (1) {
+    for (;;) {
         mpd_readline(fd, line, sizeof(line));
-        if (strncmp(line, "OK", 2) == 0) break;
+        if (strncmp(line, "OK",  2) == 0) break;
         if (strncmp(line, "ACK", 3) == 0) break;
-
-        if      (strncmp(line, "Title: ",  7) == 0)
-            snprintf(s->title,  sizeof(s->title),  "%s", line+7);
-        else if (strncmp(line, "Artist: ", 8) == 0)
-            snprintf(s->artist, sizeof(s->artist), "%s", line+8);
-        else if (strncmp(line, "Album: ",  7) == 0)
-            snprintf(s->album,  sizeof(s->album),  "%s", line+7);
+        if      (strncmp(line, "Title: ",  7) == 0) snprintf(s->title,  sizeof(s->title),  "%s", line+7);
+        else if (strncmp(line, "Artist: ", 8) == 0) snprintf(s->artist, sizeof(s->artist), "%s", line+8);
+        else if (strncmp(line, "Album: ",  7) == 0) snprintf(s->album,  sizeof(s->album),  "%s", line+7);
     }
 
-    /* ── status ── */
+    /* status */
     send(fd, "status\n", 7, 0);
-
     s->volume = -1; s->bitrate = 0; s->samplerate = 0;
+    s->song = -1; s->playlistlen = 0;
     snprintf(s->state, sizeof(s->state), "stop");
     s->elapsed = s->duration = 0;
-
-    while (1) {
+    for (;;) {
         mpd_readline(fd, line, sizeof(line));
-        if (strncmp(line, "OK", 2) == 0) break;
+        if (strncmp(line, "OK",  2) == 0) break;
         if (strncmp(line, "ACK", 3) == 0) break;
-
-        if      (strncmp(line, "state: ",    7) == 0)
-            snprintf(s->state, sizeof(s->state), "%s", line+7);
-        else if (strncmp(line, "volume: ",   8) == 0)
-            s->volume = atoi(line+8);
-        else if (strncmp(line, "bitrate: ",  9) == 0)
-            s->bitrate = atoi(line+9);
-        else if (strncmp(line, "elapsed: ", 9) == 0)
-            s->elapsed = (int)atof(line+9);
-        else if (strncmp(line, "duration: ",10) == 0)
-            s->duration = (int)atof(line+10);
-        else if (strncmp(line, "audio: ",   7) == 0) {
-            /* "44100:16:2" */
-            s->samplerate = atoi(line+7);
-        }
+        if      (strncmp(line, "state: ",          7) == 0) snprintf(s->state, sizeof(s->state), "%s", line+7);
+        else if (strncmp(line, "volume: ",          8) == 0) s->volume      = atoi(line+8);
+        else if (strncmp(line, "bitrate: ",         9) == 0) s->bitrate     = atoi(line+9);
+        else if (strncmp(line, "elapsed: ",         9) == 0) s->elapsed     = (int)atof(line+9);
+        else if (strncmp(line, "duration: ",       10) == 0) s->duration    = (int)atof(line+10);
+        else if (strncmp(line, "audio: ",           7) == 0) s->samplerate  = atoi(line+7);
+        else if (strncmp(line, "song: ",            6) == 0) s->song        = atoi(line+6);
+        else if (strncmp(line, "playlistlength: ", 16) == 0) s->playlistlen = atoi(line+16);
     }
 
     send(fd, "close\n", 6, 0);
     close(fd);
     s->connected = 1;
 
-    /* fallback display strings */
     if (!s->title[0])  snprintf(s->title,  sizeof(s->title),  "(no title)");
     if (!s->artist[0]) snprintf(s->artist, sizeof(s->artist), "(unknown artist)");
 }
 
 /* ══════════════════════════════════════════════════════════════
- *  Drawing helpers
+ *  Drawing primitives
  * ══════════════════════════════════════════════════════════════ */
 
-static void set_vfd_bright(cairo_t *cr) { cairo_set_source_rgb(cr, COL_BRIGHT); }
-static void set_vfd_dim   (cairo_t *cr) { cairo_set_source_rgb(cr, COL_DIM);    }
-static void set_vfd_accent(cairo_t *cr) { cairo_set_source_rgb(cr, COL_ACCENT); }
-
-/* rounded rectangle */
-static void rrect(cairo_t *cr, double x, double y, double w, double h, double r)
+static void rrect(cairo_t *cr,
+                  double x, double y, double w, double h, double r)
 {
     cairo_new_sub_path(cr);
-    cairo_arc(cr, x+w-r, y+r,   r,  -G_PI/2,  0);
-    cairo_arc(cr, x+w-r, y+h-r, r,   0,        G_PI/2);
-    cairo_arc(cr, x+r,   y+h-r, r,   G_PI/2,   G_PI);
-    cairo_arc(cr, x+r,   y+r,   r,   G_PI,    -G_PI/2);
+    cairo_arc(cr, x+w-r, y+r,   r, -G_PI/2,  0);
+    cairo_arc(cr, x+w-r, y+h-r, r,  0,        G_PI/2);
+    cairo_arc(cr, x+r,   y+h-r, r,  G_PI/2,   G_PI);
+    cairo_arc(cr, x+r,   y+r,   r,  G_PI,    -G_PI/2);
     cairo_close_path(cr);
 }
 
-/* glowing dot (LED / VFD segment pixel) */
-static void glow_dot(cairo_t *cr, double cx, double cy, double r,
-                     double rr, double gg, double bb)
+/* radial glow dot — used for LEDs and progress segments */
+static void glow_dot(cairo_t *cr,
+                     double cx, double cy, double r,
+                     double rr, double gg, double bb, double alpha)
 {
-    cairo_pattern_t *p = cairo_pattern_create_radial(cx, cy, 0, cx, cy, r*2.5);
-    cairo_pattern_add_color_stop_rgba(p, 0.0, rr, gg, bb, 1.0);
-    cairo_pattern_add_color_stop_rgba(p, 0.5, rr*0.6, gg*0.6, bb*0.6, 0.6);
-    cairo_pattern_add_color_stop_rgba(p, 1.0, 0, 0, 0, 0);
+    cairo_pattern_t *p =
+        cairo_pattern_create_radial(cx, cy, 0, cx, cy, r * 2.8);
+    cairo_pattern_add_color_stop_rgba(p, 0.00, rr,       gg,       bb,       alpha);
+    cairo_pattern_add_color_stop_rgba(p, 0.45, rr * 0.7, gg * 0.7, bb * 0.7, alpha * 0.55);
+    cairo_pattern_add_color_stop_rgba(p, 1.00, 0, 0, 0, 0);
     cairo_set_source(cr, p);
-    cairo_arc(cr, cx, cy, r, 0, 2*G_PI);
+    cairo_arc(cr, cx, cy, r, 0, 2 * G_PI);
     cairo_fill(cr);
     cairo_pattern_destroy(p);
 }
 
-/* progress bar as a row of segment dots */
-static void draw_progress(cairo_t *cr, double x, double y, double w, double h,
-                          double frac)
+/* dot-segment progress bar */
+static void draw_progress(cairo_t *cr,
+                           double x, double y, double w, double h,
+                           double frac)
 {
-    int  n   = (int)(w / 5.0);
-    int  lit = (int)(frac * n);
-    double r = h * 0.38;
+    const double pitch = 5.5;
+    int n   = (int)(w / pitch);
+    int lit = (int)(frac * n);
+    double r = h * 0.40;
 
     for (int i = 0; i < n; i++) {
-        double cx = x + i * 5.0 + 2.5;
+        double cx = x + i * pitch + pitch / 2.0;
         double cy = y + h / 2.0;
         if (i < lit)
-            glow_dot(cr, cx, cy, r, COL_BRIGHT);
+            glow_dot(cr, cx, cy, r,     COL_BRIGHT, 1.0);
         else
-            glow_dot(cr, cx, cy, r*0.5, COL_DIM);
+            glow_dot(cr, cx, cy, r*0.6, COL_DIM,    1.0);
     }
 }
 
-/* text with glow using Pango */
-static void draw_text_glow(cairo_t *cr,
-                           double x, double y,
-                           const char *text,
-                           const char *font_desc,
-                           double rr, double gg, double bb,
-                           double alpha,
-                           PangoAlignment align,
-                           double clip_w)   /* 0 = no clip */
+/* Crisp Pango text — pixel-snapped, no blur */
+static void draw_text(cairo_t *cr,
+                      double x, double y,
+                      const char *text,
+                      const char *font,
+                      double rr, double gg, double bb, double alpha,
+                      PangoAlignment align,
+                      double clip_w)   /* 0 = no width constraint */
 {
-    PangoLayout *layout = pango_cairo_create_layout(cr);
-    PangoFontDescription *fd = pango_font_description_from_string(font_desc);
-    pango_layout_set_font_description(layout, fd);
+    PangoLayout *lo = pango_cairo_create_layout(cr);
+    PangoFontDescription *fd = pango_font_description_from_string(font);
+    pango_layout_set_font_description(lo, fd);
     pango_font_description_free(fd);
-    pango_layout_set_text(layout, text, -1);
-    pango_layout_set_alignment(layout, align);
-    if (clip_w > 0) pango_layout_set_width(layout, (int)(clip_w * PANGO_SCALE));
+    pango_layout_set_text(lo, text, -1);
+    pango_layout_set_alignment(lo, align);
+    if (clip_w > 0)
+        pango_layout_set_width(lo, (int)(clip_w * PANGO_SCALE));
 
-    /* glow pass */
+    /* snap to whole pixels so hinting works properly */
+    double px = floor(x), py = floor(y);
+
     cairo_save(cr);
-    cairo_translate(cr, x, y);
-    cairo_set_source_rgba(cr, rr, gg, bb, alpha * 0.35);
-    for (int dx = -2; dx <= 2; dx++)
-    for (int dy = -2; dy <= 2; dy++) {
-        cairo_save(cr);
-        cairo_translate(cr, dx, dy);
-        pango_cairo_show_layout(cr, layout);
-        cairo_restore(cr);
-    }
-    /* crisp pass */
+    cairo_translate(cr, px, py);
     cairo_set_source_rgba(cr, rr, gg, bb, alpha);
-    pango_cairo_show_layout(cr, layout);
+    pango_cairo_show_layout(cr, lo);
     cairo_restore(cr);
 
-    g_object_unref(layout);
+    g_object_unref(lo);
 }
 
-/* measure text width in pixels */
-static int text_pixel_width(cairo_t *cr, const char *text, const char *font_desc)
+static int measure_text_w(cairo_t *cr, const char *text, const char *font)
 {
-    PangoLayout *layout = pango_cairo_create_layout(cr);
-    PangoFontDescription *fd = pango_font_description_from_string(font_desc);
-    pango_layout_set_font_description(layout, fd);
+    PangoLayout *lo = pango_cairo_create_layout(cr);
+    PangoFontDescription *fd = pango_font_description_from_string(font);
+    pango_layout_set_font_description(lo, fd);
     pango_font_description_free(fd);
-    pango_layout_set_text(layout, text, -1);
-    int w, h;
-    pango_layout_get_pixel_size(layout, &w, &h);
-    g_object_unref(layout);
+    pango_layout_set_text(lo, text, -1);
+    int w, h; pango_layout_get_pixel_size(lo, &w, &h);
+    g_object_unref(lo);
     return w;
 }
 
+static void hairline(cairo_t *cr,
+                     double x0, double y, double x1,
+                     double rr, double gg, double bb, double alpha)
+{
+    cairo_set_source_rgba(cr, rr, gg, bb, alpha);
+    cairo_set_line_width(cr, 0.5);
+    cairo_move_to(cr, x0, y);
+    cairo_line_to(cr, x1, y);
+    cairo_stroke(cr);
+}
+
 /* ══════════════════════════════════════════════════════════════
- *  Main draw callback
+ *  Main draw
  * ══════════════════════════════════════════════════════════════ */
 
 static gboolean on_draw(GtkWidget *widget, cairo_t *cr, gpointer user_data)
 {
+    (void)widget;
     AppData  *app = (AppData *)user_data;
     MpdState *s   = &app->mpd;
 
-    const double W = WIN_W;
-    const double H = WIN_H;
+    const double W = WIN_W, H = WIN_H;
 
-    /* ── chassis background ── */
-    cairo_set_source_rgb(cr, COL_BG);
+    /* ── outer chassis ── */
+    cairo_set_source_rgb(cr, COL_CHASSIS);
     cairo_paint(cr);
 
-    /* ── outer bezel (brushed metal feel via gradient) ── */
+    /* ── bezel gradient ── */
     {
         cairo_pattern_t *p = cairo_pattern_create_linear(0, 0, W, H);
-        cairo_pattern_add_color_stop_rgb(p, 0.0, 0.22, 0.22, 0.26);
-        cairo_pattern_add_color_stop_rgb(p, 0.5, 0.14, 0.14, 0.18);
-        cairo_pattern_add_color_stop_rgb(p, 1.0, 0.10, 0.10, 0.14);
+        cairo_pattern_add_color_stop_rgb(p, 0.0, 0.24, 0.24, 0.28);
+        cairo_pattern_add_color_stop_rgb(p, 0.5, 0.15, 0.15, 0.19);
+        cairo_pattern_add_color_stop_rgb(p, 1.0, 0.09, 0.09, 0.13);
         cairo_set_source(cr, p);
         rrect(cr, 4, 4, W-8, H-8, 8);
         cairo_fill(cr);
         cairo_pattern_destroy(p);
     }
 
-    /* ── screen area ── */
-    const double SX = 12, SY = 10, SW = W-24, SH = H-55;
+    /* ── screen ── */
+    /* screen fills the bezel with a small inset margin */
+    const double SX = 10, SY = 8, SW = W-20, SH = H-16;
     {
-        /* deep recess shadow */
-        cairo_set_source_rgba(cr, 0,0,0, 0.8);
+        /* drop-shadow / recess */
+        cairo_set_source_rgba(cr, 0, 0, 0, 0.85);
         rrect(cr, SX-2, SY-2, SW+4, SH+4, 5);
         cairo_fill(cr);
 
+        /* screen fill */
         cairo_pattern_t *p = cairo_pattern_create_linear(SX, SY, SX, SY+SH);
-        cairo_pattern_add_color_stop_rgb(p, 0.0, 0.01, 0.03, 0.10);
-        cairo_pattern_add_color_stop_rgb(p, 1.0, 0.02, 0.05, 0.16);
+        cairo_pattern_add_color_stop_rgb(p, 0.0, 0.010, 0.025, 0.095);
+        cairo_pattern_add_color_stop_rgb(p, 1.0, 0.018, 0.040, 0.140);
         cairo_set_source(cr, p);
         rrect(cr, SX, SY, SW, SH, 4);
         cairo_fill(cr);
         cairo_pattern_destroy(p);
 
-        /* subtle scanlines */
-        cairo_set_source_rgba(cr, 0, 0, 0, 0.12);
-        for (double ly = SY; ly < SY+SH; ly += 2) {
+        /* scanlines */
+        cairo_set_source_rgba(cr, 0, 0, 0, 0.10);
+        for (double ly = SY + 1; ly < SY+SH; ly += 2) {
             cairo_rectangle(cr, SX, ly, SW, 1);
         }
         cairo_fill(cr);
 
-        /* screen inner glow */
-        cairo_pattern_t *g = cairo_pattern_create_radial(SX+SW/2, SY+SH/2, 10,
-                                                          SX+SW/2, SY+SH/2, SW*0.7);
-        cairo_pattern_add_color_stop_rgba(g, 0.0, 0.0, 0.15, 0.40, 0.25);
-        cairo_pattern_add_color_stop_rgba(g, 1.0, 0.0, 0.00, 0.00, 0.00);
+        /* centre bloom */
+        cairo_pattern_t *g = cairo_pattern_create_radial(
+            SX+SW/2, SY+SH*0.45, 8,
+            SX+SW/2, SY+SH*0.45, SW * 0.65);
+        cairo_pattern_add_color_stop_rgba(g, 0.0, 0.00, 0.12, 0.38, 0.22);
+        cairo_pattern_add_color_stop_rgba(g, 1.0, 0.00, 0.00, 0.00, 0.00);
         cairo_set_source(cr, g);
         rrect(cr, SX, SY, SW, SH, 4);
         cairo_fill(cr);
         cairo_pattern_destroy(g);
     }
 
-    /* ── brand label ── */
-    draw_text_glow(cr, SX+4, SY+3, "RETRO·MPD", "Mono 6",
-                   COL_ACCENT, 0.7, PANGO_ALIGN_LEFT, 0);
+    /* all further drawing is inside screen area; clip to it */
+    cairo_save(cr);
+    rrect(cr, SX, SY, SW, SH, 4);
+    cairo_clip(cr);
 
-    /* ── connection status LED ── */
+    /*
+     * Vertical layout — absolute Y values derived from SY=8, SH=224:
+     *
+     *   SY+ 4  …  15   brand label / LED              (row 0)
+     *   SY+16  …  17   separator
+     *   SY+19  …  52   state glyph + title marquee    (row 1, 16pt)
+     *   SY+53  …  54   separator
+     *   SY+57  …  77   artist                         (row 2, 13pt)
+     *   SY+80  …  97   album                          (row 3, 11pt)
+     *   SY+99  … 100   separator
+     *   SY+104 … 118   progress bar                   (row 4, 14px tall)
+     *   SY+121 … 143   time elapsed / total           (row 5, 15pt)
+     *   SY+145 … 146   separator
+     *   SY+150 … 162   tech info (bitrate/rate/vol)   (row 6, 9pt)
+     *   SY+165 … 166   separator
+     *   SY+170 … 185   REP · RND · SGL indicators     (row 7)
+     *   SY+189 … 200   remaining time                 (row 8, dim)
+     *   SY+204 … 220   volume bar                     (row 9)
+     */
+
+    /* ── row 0: brand label + connection LED ─────────────────── */
+    draw_text(cr, SX+6, SY+4, "RETRO\xC2\xB7MPD", "Mono 7",
+              COL_MID, 0.70, PANGO_ALIGN_LEFT, 0);
+
     if (s->connected)
-        glow_dot(cr, SW+SX-7, SY+7, 3.5, COL_AMBER);
+        glow_dot(cr, SX+SW-9, SY+10, 4.5, COL_AMBER, 1.0);
     else
-        glow_dot(cr, SW+SX-7, SY+7, 3.5, COL_RED_LED);
+        glow_dot(cr, SX+SW-9, SY+10, 4.5, COL_RED,   1.0);
 
-    /* ── play state glyph ── */
+    /* ── separator ── */
+    hairline(cr, SX+5, SY+18, SX+SW-5, COL_MID, 0.25);
+
+    /* ── row 1: play-state glyph + scrolling title ───────────── */
     {
-        const char *glyph =
-            strcmp(s->state, "play")  == 0 ? "▶" :
-            strcmp(s->state, "pause") == 0 ? "⏸" : "■";
-        double rr = strcmp(s->state,"play")==0 ? 0.2 : 0.7;
-        double gg = strcmp(s->state,"play")==0 ? 0.9 : 0.4;
-        double bb = strcmp(s->state,"play")==0 ? 0.3 : 0.1;
-        draw_text_glow(cr, SX+6, SY+18, glyph, "Sans Bold 14",
-                       rr, gg, bb, 1.0, PANGO_ALIGN_LEFT, 0);
-    }
+        const char *glyph;
+        double gr, gg_c, gb;
+        if      (strcmp(s->state, "play")  == 0) { glyph = "\xe2\x96\xb6"; gr=0.15; gg_c=0.92; gb=0.35; }
+        else if (strcmp(s->state, "pause") == 0) { glyph = "\xe2\x8f\xb8"; gr=0.95; gg_c=0.75; gb=0.05; }
+        else                                      { glyph = "\xe2\x96\xa0"; gr=0.65; gg_c=0.15; gb=0.10; }
+        draw_text(cr, SX+4, SY+21, glyph, "Sans Bold 16",
+                  gr, gg_c, gb, 1.0, PANGO_ALIGN_LEFT, 0);
 
-    /* ── scrolling title (marquee) ── */
-    {
-        const char *title_font = "Mono Bold 13";
-        double tx = SX + 28;
-        double ty = SY + 17;
-        double tw = SW - 36;
+        const char *tf = "Mono Bold 16";
+        double tx = SX + 30, ty = SY + 21, tw = SW - 36;
 
-        /* measure once per title change */
-        if (app->title_px_width == 0)
-            app->title_px_width = text_pixel_width(cr, s->title, title_font) + 30;
+        if (app->title_px_w == 0)
+            app->title_px_w = measure_text_w(cr, s->title, tf) + 40;
 
         cairo_save(cr);
-        cairo_rectangle(cr, tx, ty, tw, 22);
+        cairo_rectangle(cr, tx, ty, tw, 28);
         cairo_clip(cr);
-
         double ox = -app->scroll_x;
-        draw_text_glow(cr, tx + ox, ty, s->title, title_font,
-                       COL_BRIGHT, 1.0, PANGO_ALIGN_LEFT, 0);
-
-        /* wrap-around copy */
-        if (ox + app->title_px_width < tw)
-            draw_text_glow(cr, tx + ox + app->title_px_width, ty, s->title,
-                           title_font, COL_BRIGHT, 1.0, PANGO_ALIGN_LEFT, 0);
-
+        draw_text(cr, tx + ox, ty, s->title, tf,
+                  COL_BRIGHT, 1.0, PANGO_ALIGN_LEFT, 0);
+        if (ox + app->title_px_w < tw)
+            draw_text(cr, tx + ox + app->title_px_w, ty, s->title, tf,
+                      COL_BRIGHT, 1.0, PANGO_ALIGN_LEFT, 0);
         cairo_restore(cr);
     }
 
-    /* ── separator line ── */
-    cairo_set_source_rgba(cr, COL_ACCENT, 0.3);
-    cairo_set_line_width(cr, 0.5);
-    cairo_move_to(cr, SX+4,    SY+42);
-    cairo_line_to(cr, SX+SW-4, SY+42);
-    cairo_stroke(cr);
+    /* ── separator ── */
+    hairline(cr, SX+5, SY+54, SX+SW-5, COL_MID, 0.25);
 
-    /* ── artist / album ── */
-    {
-        char info[300];
-        snprintf(info, sizeof(info), "%s", s->artist);
-        draw_text_glow(cr, SX+6, SY+46, info, "Mono 9",
-                       COL_ACCENT, 0.9, PANGO_ALIGN_LEFT, SW-10);
+    /* ── row 2: artist ───────────────────────────────────────── */
+    draw_text(cr, SX+6, SY+58, s->artist, "Mono 13",
+              COL_MID, 0.95, PANGO_ALIGN_LEFT, SW-10);
 
-        snprintf(info, sizeof(info), "%s", s->album);
-        draw_text_glow(cr, SX+6, SY+60, info, "Mono 8",
-                       COL_DIM, 1.0, PANGO_ALIGN_LEFT, SW-10);
-    }
+    /* ── row 3: album ────────────────────────────────────────── */
+    draw_text(cr, SX+6, SY+79, s->album[0] ? s->album : "", "Mono 11",
+              COL_DIM, 1.0, PANGO_ALIGN_LEFT, SW-10);
 
-    /* ── separator line ── */
-    cairo_set_source_rgba(cr, COL_ACCENT, 0.2);
-    cairo_move_to(cr, SX+4,    SY+78);
-    cairo_line_to(cr, SX+SW-4, SY+78);
-    cairo_stroke(cr);
+    /* ── separator ── */
+    hairline(cr, SX+5, SY+100, SX+SW-5, COL_MID, 0.22);
 
-    /* ── progress bar ── */
+    /* ── row 4: progress bar (taller for easier reading) ─────── */
     {
         double frac = (s->duration > 0)
-                      ? (double)s->elapsed / s->duration : 0.0;
-        draw_progress(cr, SX+6, SY+82, SW-12, 8, frac);
+                      ? (double)s->elapsed / (double)s->duration : 0.0;
+        draw_progress(cr, SX+6, SY+105, SW-12, 14, frac);
     }
 
-    /* ── time readout ── */
+    /* ── row 5: time — centred, prominent ───────────────────── */
     {
-        char tbuf[32];
-        int es = s->elapsed,  em = es/60; es %= 60;
-        int ds = s->duration, dm = ds/60; ds %= 60;
-        snprintf(tbuf, sizeof(tbuf), "%02d:%02d / %02d:%02d", em, es, dm, ds);
-        draw_text_glow(cr, SX + (SW/2), SY+94, tbuf, "Mono Bold 9",
-                       COL_BRIGHT, 0.85, PANGO_ALIGN_CENTER, SW);
+        char t[32];
+        int em = s->elapsed/60, es = s->elapsed%60;
+        int dm = s->duration/60, ds = s->duration%60;
+        snprintf(t, sizeof(t), "%02d:%02d / %02d:%02d", em, es, dm, ds);
+        draw_text(cr, SX + SW/2.0, SY+123, t, "Mono Bold 15",
+                  COL_BRIGHT, 0.95, PANGO_ALIGN_CENTER, SW);
     }
 
-    /* ── separator line ── */
-    cairo_set_source_rgba(cr, COL_ACCENT, 0.2);
-    cairo_move_to(cr, SX+4,    SY+110);
-    cairo_line_to(cr, SX+SW-4, SY+110);
-    cairo_stroke(cr);
+    /* ── separator ── */
+    hairline(cr, SX+5, SY+148, SX+SW-5, COL_MID, 0.20);
 
-    /* ── tech readout: bitrate / samplerate / volume ── */
+    /* ── row 6: playlist position (left) + bitrate/rate/vol (centre) ── */
     {
+        /* left: track index "11/11" */
+        if (s->song >= 0 && s->playlistlen > 0) {
+            char pos[16];
+            snprintf(pos, sizeof(pos), "%d/%d", s->song + 1, s->playlistlen);
+            draw_text(cr, SX+6, SY+152, pos, "Mono Bold 9",
+                      COL_MID, 0.90, PANGO_ALIGN_LEFT, 0);
+        }
+
+        /* centre: bitrate / sample-rate / volume */
         char tech[128];
-        int  sr_khz = s->samplerate / 1000;
-        if (s->bitrate > 0 || s->samplerate > 0)
-            snprintf(tech, sizeof(tech), "%dkbps  %dkHz  VOL:%d%%",
-                     s->bitrate, sr_khz,
-                     s->volume >= 0 ? s->volume : 0);
-        else
-            snprintf(tech, sizeof(tech), "VOL: %d%%",
-                     s->volume >= 0 ? s->volume : 0);
+        int  sr  = s->samplerate / 1000;
+        int  vol = (s->volume >= 0) ? s->volume : 0;
 
-        draw_text_glow(cr, SX + SW/2, SY+114, tech, "Mono 8",
-                       COL_DIM, 1.0, PANGO_ALIGN_CENTER, SW);
+        if (s->bitrate > 0 && sr > 0)
+            snprintf(tech, sizeof(tech),
+                     "%d kbps  \xC2\xB7  %d kHz  \xC2\xB7  VOL %d%%",
+                     s->bitrate, sr, vol);
+        else if (sr > 0)
+            snprintf(tech, sizeof(tech),
+                     "%d kHz  \xC2\xB7  VOL %d%%", sr, vol);
+        else
+            snprintf(tech, sizeof(tech), "VOL %d%%", vol);
+
+        draw_text(cr, SX + SW/2.0, SY+152, tech, "Mono 9",
+                  COL_DIM, 1.0, PANGO_ALIGN_CENTER, SW);
     }
 
-    /* ── bottom panel: control buttons (decorative) ── */
+    /* ── separator ── */
+    hairline(cr, SX+5, SY+170, SX+SW-5, COL_MID, 0.18);
+
+    /* ── row 7: REP / RND / SGL indicator dots + labels ─────── */
     {
-        const double BY  = H - 42;
-        const double BH  = 22;
-        const double BW  = 36;
-        const double GAP = 6;
-        const char  *labels[] = { "⏮", "⏪", "⏩", "⏭", "⏏" };
-        const int    NB = 5;
-        double total = NB*BW + (NB-1)*GAP;
-        double bx    = (W - total) / 2.0;
-
-        for (int i = 0; i < NB; i++) {
-            double x = bx + i*(BW+GAP);
-
-            /* button body */
-            cairo_pattern_t *p = cairo_pattern_create_linear(x, BY, x, BY+BH);
-            cairo_pattern_add_color_stop_rgb(p, 0.0, 0.28, 0.28, 0.32);
-            cairo_pattern_add_color_stop_rgb(p, 1.0, 0.14, 0.14, 0.18);
-            cairo_set_source(cr, p);
-            rrect(cr, x, BY, BW, BH, 3);
-            cairo_fill(cr);
-            cairo_pattern_destroy(p);
-
-            /* button highlight */
-            cairo_set_source_rgba(cr, 1,1,1, 0.08);
-            rrect(cr, x+1, BY+1, BW-2, BH/2, 3);
-            cairo_fill(cr);
-
-            /* button border */
-            cairo_set_source_rgba(cr, 0, 0, 0, 0.6);
-            cairo_set_line_width(cr, 1);
-            rrect(cr, x, BY, BW, BH, 3);
-            cairo_stroke(cr);
-
-            /* label */
-            draw_text_glow(cr, x + BW/2 - 6, BY+3, labels[i], "Sans 10",
-                           0.70, 0.70, 0.75, 1.0, PANGO_ALIGN_LEFT, 0);
+        const char *labels[] = { "REP", "RND", "SGL" };
+        double spacing = SW / 4.0;
+        for (int i = 0; i < 3; i++) {
+            double cx = SX + spacing * (i + 1);
+            /* dots dim until repeat/random/single parsed from status */
+            glow_dot(cr, cx, SY+179, 4.0, COL_DIM, 1.0);
+            draw_text(cr, cx - 9, SY+186, labels[i], "Mono 7",
+                      COL_DIM, 0.80, PANGO_ALIGN_LEFT, 0);
         }
     }
 
-    /* ── decorative rivets ── */
+    /* ── row 8: remaining time (right-aligned, subtle) ───────── */
+    if (s->duration > 0) {
+        int rem = s->duration - s->elapsed;
+        int rm = rem/60, rs = rem%60;
+        char rbuf[24];
+        snprintf(rbuf, sizeof(rbuf), "-%02d:%02d remaining", rm, rs);
+        draw_text(cr, SX + SW/2.0, SY+200, rbuf, "Mono 8",
+                  COL_DIM, 0.60, PANGO_ALIGN_CENTER, SW);
+    }
+
+    /* ── row 9: volume bar ───────────────────────────────────── */
     {
-        double rv[][2] = {{9,9},{W-9,9},{9,H-9},{W-9,H-9}};
-        for (int i=0;i<4;i++) {
+        double vol_frac = (s->volume >= 0) ? s->volume / 100.0 : 0.0;
+        /* thin filled bar across bottom */
+        double bx = SX + 6, by = SY + SH - 12, bw = SW - 12, bh = 6;
+        /* track */
+        cairo_set_source_rgba(cr, COL_DIM, 0.5);
+        cairo_rectangle(cr, bx, by, bw, bh);
+        cairo_fill(cr);
+        /* fill */
+        if (vol_frac > 0) {
+            cairo_pattern_t *p =
+                cairo_pattern_create_linear(bx, 0, bx + bw, 0);
+            cairo_pattern_add_color_stop_rgba(p, 0.0, COL_MID,    0.7);
+            cairo_pattern_add_color_stop_rgba(p, 0.8, COL_BRIGHT, 0.9);
+            cairo_pattern_add_color_stop_rgba(p, 1.0, COL_BRIGHT, 0.9);
+            cairo_set_source(cr, p);
+            cairo_rectangle(cr, bx, by, bw * vol_frac, bh);
+            cairo_fill(cr);
+            cairo_pattern_destroy(p);
+        }
+        /* "VOL" label left of bar */
+        draw_text(cr, SX+6, SY+SH-14, "VOL", "Mono 6",
+                  COL_DIM, 0.55, PANGO_ALIGN_LEFT, 0);
+    }
+
+    /* ── screen glare ── */
+    {
+        cairo_pattern_t *g =
+            cairo_pattern_create_linear(SX, SY, SX + SW*0.55, SY + SH*0.35);
+        cairo_pattern_add_color_stop_rgba(g, 0.0, 1,1,1, 0.035);
+        cairo_pattern_add_color_stop_rgba(g, 1.0, 1,1,1, 0.000);
+        cairo_set_source(cr, g);
+        cairo_paint(cr);
+        cairo_pattern_destroy(g);
+    }
+
+    cairo_restore(cr);  /* end screen clip */
+
+    /* ── corner rivets ── */
+    {
+        double rv[][2] = { {9,9}, {W-9,9}, {9,H-9}, {W-9,H-9} };
+        for (int i = 0; i < 4; i++) {
             cairo_pattern_t *p = cairo_pattern_create_radial(
                 rv[i][0]-1, rv[i][1]-1, 0,
-                rv[i][0],   rv[i][1],   4);
-            cairo_pattern_add_color_stop_rgb(p, 0, 0.45,0.45,0.50);
-            cairo_pattern_add_color_stop_rgb(p, 1, 0.12,0.12,0.15);
+                rv[i][0],   rv[i][1],   4.5);
+            cairo_pattern_add_color_stop_rgb(p, 0.0, 0.48, 0.48, 0.53);
+            cairo_pattern_add_color_stop_rgb(p, 1.0, 0.11, 0.11, 0.14);
             cairo_set_source(cr, p);
             cairo_arc(cr, rv[i][0], rv[i][1], 3.5, 0, 2*G_PI);
             cairo_fill(cr);
             cairo_pattern_destroy(p);
         }
-    }
-
-    /* ── screen reflection glare ── */
-    {
-        cairo_save(cr);
-        cairo_rectangle(cr, SX, SY, SW, SH);
-        cairo_clip(cr);
-        cairo_pattern_t *g = cairo_pattern_create_linear(SX, SY, SX+SW*0.6, SY+SH*0.4);
-        cairo_pattern_add_color_stop_rgba(g, 0.0, 1,1,1, 0.04);
-        cairo_pattern_add_color_stop_rgba(g, 1.0, 1,1,1, 0.00);
-        cairo_set_source(cr, g);
-        cairo_paint(cr);
-        cairo_pattern_destroy(g);
-        cairo_restore(cr);
     }
 
     return FALSE;
@@ -551,34 +571,31 @@ static gboolean on_draw(GtkWidget *widget, cairo_t *cr, gpointer user_data)
  *  Timers
  * ══════════════════════════════════════════════════════════════ */
 
-static gboolean on_anim_tick(gpointer data)
+static gboolean on_anim(gpointer data)
 {
     AppData *app = (AppData *)data;
 
     if (strcmp(app->mpd.state, "play") == 0) {
-        app->scroll_x += app->scroll_px_per_tick;
-        if (app->title_px_width > 0 &&
-            app->scroll_x >= app->title_px_width)
-            app->scroll_x = 0;
+        app->scroll_x += app->scroll_speed;
+        if (app->title_px_w > 0 && app->scroll_x >= app->title_px_w)
+            app->scroll_x = 0.0;
     }
 
     gtk_widget_queue_draw(app->canvas);
     return TRUE;
 }
 
-static gboolean on_poll_tick(gpointer data)
+static gboolean on_poll(gpointer data)
 {
     AppData *app = (AppData *)data;
-
-    char old_title[256];
-    snprintf(old_title, sizeof(old_title), "%s", app->mpd.title);
+    char old[256];
+    snprintf(old, sizeof(old), "%s", app->mpd.title);
 
     mpd_poll(&app->mpd);
 
-    /* reset marquee when track changes */
-    if (strcmp(old_title, app->mpd.title) != 0) {
-        app->scroll_x = 0;
-        app->title_px_width = 0;
+    if (strcmp(old, app->mpd.title) != 0) {
+        app->scroll_x  = 0.0;
+        app->title_px_w = 0;
     }
 
     gtk_widget_queue_draw(app->canvas);
@@ -586,7 +603,7 @@ static gboolean on_poll_tick(gpointer data)
 }
 
 /* ══════════════════════════════════════════════════════════════
- *  Entry point
+ *  Main
  * ══════════════════════════════════════════════════════════════ */
 
 int main(int argc, char *argv[])
@@ -595,28 +612,24 @@ int main(int argc, char *argv[])
 
     AppData app;
     memset(&app, 0, sizeof(app));
-    app.scroll_px_per_tick = 0.8;   /* pixels per animation frame */
+    app.scroll_speed = 0.75;
     snprintf(app.mpd.state, sizeof(app.mpd.state), "stop");
 
-    /* initial poll */
     mpd_poll(&app.mpd);
 
-    /* window */
     GtkWidget *win = gtk_window_new(GTK_WINDOW_TOPLEVEL);
-    gtk_window_set_title(GTK_WINDOW(win), "MPD – Retro Display");
+    gtk_window_set_title(GTK_WINDOW(win), "MPD");
     gtk_window_set_default_size(GTK_WINDOW(win), WIN_W, WIN_H);
     gtk_window_set_resizable(GTK_WINDOW(win), FALSE);
     g_signal_connect(win, "destroy", G_CALLBACK(gtk_main_quit), NULL);
 
-    /* drawing area */
     app.canvas = gtk_drawing_area_new();
     gtk_widget_set_size_request(app.canvas, WIN_W, WIN_H);
     g_signal_connect(app.canvas, "draw", G_CALLBACK(on_draw), &app);
     gtk_container_add(GTK_CONTAINER(win), app.canvas);
 
-    /* timers */
-    app.anim_id = g_timeout_add(33,       on_anim_tick, &app);  /* ~30 fps */
-    app.poll_id = g_timeout_add(POLL_MS,  on_poll_tick, &app);
+    app.anim_id = g_timeout_add(33,      on_anim, &app);   /* ~30 fps */
+    app.poll_id = g_timeout_add(POLL_MS, on_poll, &app);
 
     gtk_widget_show_all(win);
     gtk_main();
