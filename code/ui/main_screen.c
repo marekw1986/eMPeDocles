@@ -12,43 +12,22 @@
 
 #include <string.h>
 
-gboolean on_draw(GtkWidget *widget, cairo_t *cr, gpointer user_data)
+void on_draw(cairo_t *cr, AppData *app)
 {
-    (void)widget;
-    AppData  *app = (AppData *)user_data;
-    MpdState *s   = &app->mpd;
+    MpdState *s = &app->mpd;
 
     const double W = WIN_W, H = WIN_H;
 
-    /* ── outer chassis ── */
-    cairo_set_source_rgb(cr, COL_CHASSIS);
-    cairo_paint(cr);
-
-    /* ── bezel ── */
-    {
-        cairo_pattern_t *p = cairo_pattern_create_linear(0, 0, W, H);
-        cairo_pattern_add_color_stop_rgb(p, 0.0, 0.24, 0.24, 0.28);
-        cairo_pattern_add_color_stop_rgb(p, 0.5, 0.15, 0.15, 0.19);
-        cairo_pattern_add_color_stop_rgb(p, 1.0, 0.09, 0.09, 0.13);
-        cairo_set_source(cr, p);
-        rrect(cr, 4, 4, W-8, H-8, 8);
-        cairo_fill(cr);
-        cairo_pattern_destroy(p);
-    }
-
-    const double SX = 10, SY = 8, SW = W-20, SH = H-16;
+    /* screen now fills the entire window — no chassis/bezel margin */
+    const double SX = 0, SY = 0, SW = W, SH = H;
 
     /* ── screen fill ── */
     {
-        cairo_set_source_rgba(cr, 0, 0, 0, 0.85);
-        rrect(cr, SX-2, SY-2, SW+4, SH+4, 5);
-        cairo_fill(cr);
-
         cairo_pattern_t *p = cairo_pattern_create_linear(SX, SY, SX, SY+SH);
         cairo_pattern_add_color_stop_rgb(p, 0.0, 0.010, 0.025, 0.095);
         cairo_pattern_add_color_stop_rgb(p, 1.0, 0.018, 0.040, 0.140);
         cairo_set_source(cr, p);
-        rrect(cr, SX, SY, SW, SH, 4);
+        cairo_rectangle(cr, SX, SY, SW, SH);
         cairo_fill(cr);
         cairo_pattern_destroy(p);
 
@@ -62,14 +41,14 @@ gboolean on_draw(GtkWidget *widget, cairo_t *cr, gpointer user_data)
         cairo_pattern_add_color_stop_rgba(g, 0.0, 0.00, 0.12, 0.38, 0.22);
         cairo_pattern_add_color_stop_rgba(g, 1.0, 0.00, 0.00, 0.00, 0.00);
         cairo_set_source(cr, g);
-        rrect(cr, SX, SY, SW, SH, 4);
+        cairo_rectangle(cr, SX, SY, SW, SH);
         cairo_fill(cr);
         cairo_pattern_destroy(g);
     }
 
     /* clip all content to screen */
     cairo_save(cr);
-    rrect(cr, SX, SY, SW, SH, 4);
+    cairo_rectangle(cr, SX, SY, SW, SH);
     cairo_clip(cr);
 
     /* ── row 0: brand label + connection LED ── */
@@ -220,21 +199,4 @@ gboolean on_draw(GtkWidget *widget, cairo_t *cr, gpointer user_data)
     }
 
     cairo_restore(cr);
-
-    /* ── corner rivets ── */
-    {
-        double rv[][2] = { {9,9},{W-9,9},{9,H-9},{W-9,H-9} };
-        for (int i=0; i<4; i++) {
-            cairo_pattern_t *p = cairo_pattern_create_radial(
-                rv[i][0]-1,rv[i][1]-1,0, rv[i][0],rv[i][1],4.5);
-            cairo_pattern_add_color_stop_rgb(p, 0.0, 0.48,0.48,0.53);
-            cairo_pattern_add_color_stop_rgb(p, 1.0, 0.11,0.11,0.14);
-            cairo_set_source(cr, p);
-            cairo_arc(cr, rv[i][0],rv[i][1], 3.5, 0, 2*G_PI);
-            cairo_fill(cr);
-            cairo_pattern_destroy(p);
-        }
-    }
-
-    return FALSE;
 }

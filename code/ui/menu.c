@@ -188,7 +188,7 @@ void menu_input(AppData *app, MenuButton btn)
     case BTN_ENTER: if (m->open) menu_enter(m); break;
     case BTN_BACK:  if (m->open) menu_back(m);  break;
     }
-    gtk_widget_queue_draw(app->canvas);
+    app_request_redraw(app);
 }
 
 /* ══════════════════════════════════════════════════════════════

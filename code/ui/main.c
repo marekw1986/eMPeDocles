@@ -1,13 +1,20 @@
 /*
- * main.c — application entry point
+ * main.c — application entry point (framebuffer backend)
  *
- * GTK window/canvas setup, keyboard input (stand-in for hardware
- * buttons — see menu.h for the GPIO integration point), and the
- * two timers that drive the UI: a ~30fps animation tick for the
- * title marquee, and a 1s poll of MPD status.
+ * No GTK: a plain loop that polls input, advances animation/MPD
+ * timers manually, draws into an offscreen Cairo surface (owned
+ * by the active backend — see fb_backend.h), and presents it.
  *
- * Build:
- *   make
+ * Backend selection happens at build time (see Makefile,
+ * BACKEND=linux|sdl) — this file only calls the fb_* interface
+ * and never knows which concrete backend is linked in.
+ *
+ * Keys (same as the original GTK build):
+ *   M             — toggle menu open / close
+ *   Up / Down     — scroll list
+ *   Right / Enter — enter submenu / select item
+ *   Left / Esc    — go back one level / close menu
+ *   Q             — quit
  *
  * MPD connection: localhost:6600 by default.
  * Override with MPD_HOST / MPD_PORT environment variables.
@@ -16,115 +23,89 @@
 #include "main_screen.h"
 #include "menu.h"
 #include "mpd_client.h"
+#include "fb_backend.h"
 
 #include <string.h>
+#include <time.h>
+#include <unistd.h>
 
-/* ══════════════════════════════════════════════════════════════
- *  Keyboard handler (stand-in for hardware buttons / IR receiver)
- * ══════════════════════════════════════════════════════════════
- *
- * Keys:
- *   M             — toggle menu open / close
- *   Up / Down     — scroll list
- *   Right / Enter — enter submenu / select item
- *   Left / Esc    — go back one level / close menu
- *
- * When moving to physical buttons on the Pi Zero, this function
- * can stay in place (useful for debugging over SSH+X11 forwarding)
- * — just add a second input source that also calls menu_input().
- * See menu.h for details.
- */
-static gboolean on_key(GtkWidget *widget, GdkEventKey *ev, gpointer data)
+/* ── timing constants ─────────────────────────────────────────
+ * Mirrors the old GTK timer intervals: ~30fps animation tick,
+ * 1Hz MPD poll. Implemented here as plain elapsed-time checks
+ * inside the main loop instead of GLib timeout sources. */
+#define ANIM_INTERVAL_MS 33
+#define POLL_INTERVAL_MS 1000
+#define LOOP_SLEEP_US    5000   /* ~5ms idle sleep between iterations */
+
+static long now_ms(void)
 {
-    (void)widget;
-    AppData *app = (AppData *)data;
-    switch (ev->keyval) {
-    case GDK_KEY_m: case GDK_KEY_M:
-        menu_input(app, BTN_MENU);  break;
-    case GDK_KEY_Up:
-        menu_input(app, BTN_UP);    break;
-    case GDK_KEY_Down:
-        menu_input(app, BTN_DOWN);  break;
-    case GDK_KEY_Right: case GDK_KEY_Return: case GDK_KEY_KP_Enter:
-        menu_input(app, BTN_ENTER); break;
-    case GDK_KEY_Left: case GDK_KEY_Escape:
-        menu_input(app, BTN_BACK);  break;
-    default:
-        return FALSE;
-    }
-    return TRUE;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
 }
 
-/* ══════════════════════════════════════════════════════════════
- *  Timers
- * ══════════════════════════════════════════════════════════════ */
-
-/* ~30fps: advances the title marquee scroll position */
-static gboolean on_anim(gpointer data)
+int main(void)
 {
-    AppData *app = (AppData *)data;
-    if (strcmp(app->mpd.state, "play") == 0) {
-        app->scroll_x += app->scroll_speed;
-        if (app->title_px_w > 0 && app->scroll_x >= app->title_px_w)
-            app->scroll_x = 0.0;
-    }
-    gtk_widget_queue_draw(app->canvas);
-    return TRUE;
-}
-
-/* 1Hz: polls MPD for playback status / current song */
-static gboolean on_poll(gpointer data)
-{
-    AppData *app = (AppData *)data;
-    char old[256];
-    snprintf(old, sizeof(old), "%s", app->mpd.title);
-
-    mpd_poll(&app->mpd);
-
-    /* reset marquee when the track changes */
-    if (strcmp(old, app->mpd.title) != 0) {
-        app->scroll_x   = 0.0;
-        app->title_px_w = 0;
-    }
-
-    gtk_widget_queue_draw(app->canvas);
-    return TRUE;
-}
-
-/* ══════════════════════════════════════════════════════════════
- *  Main
- * ══════════════════════════════════════════════════════════════ */
-
-int main(int argc, char *argv[])
-{
-    gtk_init(&argc, &argv);
-
     AppData app;
     memset(&app, 0, sizeof(app));
     app.scroll_speed = 0.75;
+    app.running = 1;
     snprintf(app.mpd.state, sizeof(app.mpd.state), "stop");
     mpd_poll(&app.mpd);
 
-    GtkWidget *win = gtk_window_new(GTK_WINDOW_TOPLEVEL);
-    gtk_window_set_title(GTK_WINDOW(win), "MPD");
-    gtk_window_set_default_size(GTK_WINDOW(win), WIN_W, WIN_H);
-    gtk_window_set_resizable(GTK_WINDOW(win), FALSE);
-    g_signal_connect(win, "destroy", G_CALLBACK(gtk_main_quit), NULL);
+    if (fb_init() != 0) {
+        fprintf(stderr, "main: failed to initialise display backend\n");
+        return 1;
+    }
 
-    app.canvas = gtk_drawing_area_new();
-    gtk_widget_set_size_request(app.canvas, WIN_W, WIN_H);
-    gtk_widget_set_can_focus(app.canvas, TRUE);
-    g_signal_connect(app.canvas, "draw",            G_CALLBACK(on_draw), &app);
-    g_signal_connect(win,        "key-press-event", G_CALLBACK(on_key),  &app);
-    gtk_container_add(GTK_CONTAINER(win), app.canvas);
+    long last_anim = now_ms();
+    long last_poll = now_ms();
+    app.dirty = 1;   /* force an initial draw */
 
-    app.anim_id = g_timeout_add(33,      on_anim, &app);
-    app.poll_id = g_timeout_add(POLL_MS, on_poll, &app);
+    while (app.running) {
+        long t = now_ms();
 
-    gtk_widget_show_all(win);
-    gtk_main();
+        /* ── input ── */
+        fb_poll_input(&app);
+        if (!app.running) break;
 
-    g_source_remove(app.anim_id);
-    g_source_remove(app.poll_id);
+        /* ── animation tick (~30fps): advance title marquee ── */
+        if (t - last_anim >= ANIM_INTERVAL_MS) {
+            last_anim = t;
+            if (strcmp(app.mpd.state, "play") == 0) {
+                app.scroll_x += app.scroll_speed;
+                if (app.title_px_w > 0 && app.scroll_x >= app.title_px_w)
+                    app.scroll_x = 0.0;
+            }
+            app_request_redraw(&app);
+        }
+
+        /* ── MPD poll (1Hz): refresh playback status ── */
+        if (t - last_poll >= POLL_INTERVAL_MS) {
+            last_poll = t;
+            char old_title[256];
+            snprintf(old_title, sizeof(old_title), "%s", app.mpd.title);
+
+            mpd_poll(&app.mpd);
+
+            if (strcmp(old_title, app.mpd.title) != 0) {
+                app.scroll_x   = 0.0;
+                app.title_px_w = 0;
+            }
+            app_request_redraw(&app);
+        }
+
+        /* ── draw + present only when something changed ── */
+        if (app.dirty) {
+            app.dirty = 0;
+            cairo_t *cr = fb_get_cairo();
+            on_draw(cr, &app);
+            fb_present();
+        }
+
+        usleep(LOOP_SLEEP_US);
+    }
+
+    fb_shutdown();
     return 0;
 }

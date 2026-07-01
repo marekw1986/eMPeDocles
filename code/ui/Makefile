@@ -1,41 +1,59 @@
-# mpd_retro — retro VFD-style MPD display with browse menu
+# mpd_retro — framebuffer build
 #
-# Source layout:
-#   app.h          shared types/constants, drawing-primitive prototypes
-#   draw_common.*  cairo/pango drawing primitives (no app/MPD state)
-#   mpd_client.*   MPD protocol I/O (sockets, polling, menu loaders, actions)
-#   menu.*         browse-menu state machine + rendering
-#                  (menu_input() is the hardware-button integration point)
-#   main_screen.*  playback screen rendering (on_draw)
-#   main.c         GTK setup, keyboard handler, timers, entry point
+# BACKEND=linux   real /dev/fb0 (Raspberry Pi / Linux console)
+# BACKEND=sdl     SDL2 window   (desktop testing)
+#
+#   make BACKEND=sdl
+#   make BACKEND=linux
+#   make              (defaults to linux)
+
+BACKEND ?= linux
 
 CC      = gcc
 TARGET  = mpd_retro
 
-SRCS    = main.c main_screen.c menu.c mpd_client.c draw_common.c
-OBJS    = $(SRCS:.c=.o)
-HDRS    = app.h main_screen.h menu.h mpd_client.h draw_common.h
+SRCS_COMMON = main.c main_screen.c menu.c mpd_client.c draw_common.c
+HDRS        = app.h fb_backend.h main_screen.h menu.h mpd_client.h draw_common.h
 
-# pkg-config may warn about liblzma on some systems; suppress stderr
-GTK_CFLAGS := $(shell pkg-config --cflags gtk+-3.0 2>/dev/null)
-GTK_LIBS   := $(shell pkg-config --libs   gtk+-3.0 2>/dev/null)
-
-# Fallback if pkg-config produced nothing (e.g. liblzma .pc missing)
-ifeq ($(strip $(GTK_CFLAGS)),)
-GTK_CFLAGS := -I/usr/include/gtk-3.0 \
-              -I/usr/include/glib-2.0 \
-              -I/usr/lib/x86_64-linux-gnu/glib-2.0/include \
-              -I/usr/include/pango-1.0 \
-              -I/usr/include/cairo \
-              -I/usr/include/gdk-pixbuf-2.0 \
-              -I/usr/include/atk-1.0 \
-              -I/usr/include/harfbuzz
-GTK_LIBS   := -lgtk-3 -lgdk-3 -lpangocairo-1.0 -lpango-1.0 \
-              -lcairo -lgobject-2.0 -lglib-2.0
+ifeq ($(BACKEND),sdl)
+  SRCS_BACKEND = fb_backend_sdl.c
+  SDL_CFLAGS  := $(shell sdl2-config --cflags 2>/dev/null)
+  SDL_LIBS    := $(shell sdl2-config --libs   2>/dev/null)
+  ifeq ($(strip $(SDL_CFLAGS)),)
+    # pkg-config fallback
+    SDL_CFLAGS := $(shell pkg-config --cflags sdl2 2>/dev/null)
+    SDL_LIBS   := $(shell pkg-config --libs   sdl2 2>/dev/null)
+  endif
+  ifeq ($(strip $(SDL_CFLAGS)),)
+    $(error SDL2 not found. Install libsdl2-dev: sudo apt install libsdl2-dev)
+  endif
+  EXTRA_CFLAGS = $(SDL_CFLAGS)
+  EXTRA_LIBS   = $(SDL_LIBS)
+else
+  SRCS_BACKEND = fb_backend_linux.c
+  EXTRA_CFLAGS =
+  EXTRA_LIBS   =
 endif
 
-CFLAGS  = -Wall -Wextra -O2 $(GTK_CFLAGS)
-LDFLAGS = $(GTK_LIBS) -lm
+SRCS = $(SRCS_COMMON) $(SRCS_BACKEND)
+OBJS = $(SRCS:.c=.o)
+
+# Cairo + Pango (no GTK)
+CAIRO_CFLAGS := $(shell pkg-config --cflags cairo pangocairo 2>/dev/null)
+CAIRO_LIBS   := $(shell pkg-config --libs   cairo pangocairo 2>/dev/null)
+
+ifeq ($(strip $(CAIRO_CFLAGS)),)
+  CAIRO_CFLAGS := -I/usr/include/cairo \
+                  -I/usr/include/pango-1.0 \
+                  -I/usr/include/glib-2.0 \
+                  -I/usr/lib/x86_64-linux-gnu/glib-2.0/include \
+                  -I/usr/include/harfbuzz
+  CAIRO_LIBS   := -lcairo -lpangocairo-1.0 -lpango-1.0 \
+                  -lgobject-2.0 -lglib-2.0
+endif
+
+CFLAGS  = -Wall -Wextra -O2 $(CAIRO_CFLAGS) $(EXTRA_CFLAGS)
+LDFLAGS = $(CAIRO_LIBS) $(EXTRA_LIBS) -lm
 
 .PHONY: all clean
 

@@ -8,7 +8,6 @@
 #ifndef APP_H
 #define APP_H
 
-#include <gtk/gtk.h>
 #include <cairo.h>
 #include <pango/pangocairo.h>
 
@@ -104,7 +103,8 @@ typedef enum { BTN_UP, BTN_DOWN, BTN_ENTER, BTN_BACK, BTN_MENU } MenuButton;
  *  Top-level application state
  * ══════════════════════════════════════════════════════════════ */
 typedef struct {
-    GtkWidget *canvas;
+    int        dirty;       /* set to request a redraw; backend clears it */
+    int        running;     /* set to 0 to request clean shutdown          */
     MpdState   mpd;
 
     double  scroll_x;       /* marquee scroll offset           */
@@ -112,10 +112,13 @@ typedef struct {
     int     title_px_w;     /* cached rendered width of title  */
 
     MenuState  menu;
-
-    guint   anim_id;
-    guint   poll_id;
 } AppData;
+
+/* Request a redraw on the next frame. Replaces GTK's
+ * gtk_widget_queue_draw() — call this from menu_input(), MPD
+ * poll callbacks, etc. The render loop in main.c checks
+ * app->dirty each frame. */
+static inline void app_request_redraw(AppData *app) { app->dirty = 1; }
 
 /* ══════════════════════════════════════════════════════════════
  *  Shared drawing primitives (implemented in draw_common.c)

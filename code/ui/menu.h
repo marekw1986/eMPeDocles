@@ -19,7 +19,7 @@
  *     // in the interrupt handler:
  *     g_idle_add(gpio_press_idle, app);
  *
- * menu_input() already calls gtk_widget_queue_draw() internally,
+ * menu_input() already calls app_request_redraw() internally,
  * so no further redraw bookkeeping is needed by the caller.
  */
 #ifndef MENU_H
