@@ -74,7 +74,7 @@ int main(void)
             last_anim = t;
             if (strcmp(app.mpd.state, "play") == 0) {
                 app.scroll_x += app.scroll_speed;
-                if (app.title_px_w > 0 && app.scroll_x >= app.title_px_w)
+                if (app.cache.title_px_w > 0 && app.scroll_x >= app.cache.title_px_w)
                     app.scroll_x = 0.0;
             }
             app_request_redraw(&app);
@@ -90,7 +90,7 @@ int main(void)
 
             if (strcmp(old_title, app.mpd.title) != 0) {
                 app.scroll_x   = 0.0;
-                app.title_px_w = 0;
+                app.cache.title_px_w = 0;
             }
             app_request_redraw(&app);
         }
